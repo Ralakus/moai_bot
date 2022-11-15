@@ -99,12 +99,23 @@ async fn leaderboard(ctx: &Context, channel: ChannelId, data: Data) -> Data {
 async fn increment_user(_ctx: &Context, user: User, data: Data) -> Data {
     let (mut user_map, mut moai_map) = data;
 
-    if user_map.get(&user.id).is_none() {
-        user_map.insert(user.id, user.name);
-    }
+    user_map.insert(user.id, user.name);
 
     let counter = moai_map.get(&user.id).unwrap_or(&0);
     moai_map.insert(user.id, counter + 1);
+
+    unsafe { DATA_CHANGED = true };
+
+    (user_map, moai_map)
+}
+
+async fn decrement_user(_ctx: &Context, user: User, data: Data) -> Data {
+    let (mut user_map, mut moai_map) = data;
+
+    user_map.insert(user.id, user.name);
+
+    let counter = moai_map.get(&user.id).unwrap_or(&0);
+    moai_map.insert(user.id, counter - 1);
 
     unsafe { DATA_CHANGED = true };
 
@@ -178,6 +189,22 @@ impl EventHandler for Handler {
             if let Err(e) = task(|data| async move { increment_user(&ctx, user, data).await }).await
             {
                 eprintln!("Message increment task failed {}", e);
+            }
+        }
+    }
+
+    async fn reaction_remove(&self, ctx: Context, reaction: Reaction) {
+        if reaction.emoji.unicode_eq("🗿") {
+            let user = match reaction.user(&ctx).await {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("Failed to get user for reaction {}", e);
+                    return;
+                }
+            };
+            if let Err(e) = task(|data| async move { decrement_user(&ctx, user, data).await }).await
+            {
+                eprintln!("Message decrement task failed {}", e);
             }
         }
     }
