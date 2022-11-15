@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::env;
+use std::future::Future;
+use std::time::Duration;
 
 use lazy_static::lazy_static;
 
@@ -7,27 +9,29 @@ use serenity::async_trait;
 use serenity::model::channel::{Message, Reaction};
 use serenity::model::gateway::Ready;
 use serenity::model::prelude::{ChannelId, MessageId, UserId};
-use serenity::model::user::User;
 use serenity::prelude::*;
 
 type MoaiMap = HashMap<UserId, usize>;
 type UserMap = HashMap<UserId, String>;
 type Data = (UserMap, MoaiMap);
 
-const DATA_STORAGE_CHANNEL: ChannelId = ChannelId(1035356938478833734);
-const DATA_STORAGE_MSG: MessageId = MessageId(1041738160050278401);
+const STORAGE_CHANNEL: ChannelId = ChannelId(1029509904203005995);
+const STORAGE_MESSAGE: MessageId = MessageId(1041734958122807417);
+
+static mut TASK_QUEUE_COUNT: usize = 0;
+static mut DATA_CHANGED: bool = false;
 
 lazy_static! {
-    static ref DATA: tokio::sync::Mutex<DataWrapper> = tokio::sync::Mutex::new(DataWrapper);
+    static ref STORAGE: tokio::sync::Mutex<DataStorage> = tokio::sync::Mutex::new(DataStorage);
+    static ref DATA: tokio::sync::Mutex<Data> =
+        tokio::sync::Mutex::new((UserMap::new(), MoaiMap::new()));
 }
 
-struct DataWrapper;
+struct DataStorage;
 
-impl DataWrapper {
+impl DataStorage {
     async fn get_data(&self, ctx: &Context) -> Result<Data, Box<dyn std::error::Error>> {
-        let data_msg = DATA_STORAGE_CHANNEL
-            .message(&ctx.http, DATA_STORAGE_MSG)
-            .await?;
+        let data_msg = STORAGE_CHANNEL.message(&ctx.http, STORAGE_MESSAGE).await?;
 
         Ok(serde_json::from_str(&data_msg.content)?)
     }
@@ -37,9 +41,7 @@ impl DataWrapper {
         ctx: &Context,
         data: Data,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut data_msg = DATA_STORAGE_CHANNEL
-            .message(&ctx.http, DATA_STORAGE_MSG)
-            .await?;
+        let mut data_msg = STORAGE_CHANNEL.message(&ctx.http, STORAGE_MESSAGE).await?;
 
         let data_str = serde_json::to_string(&data)?;
 
@@ -47,27 +49,19 @@ impl DataWrapper {
 
         Ok(())
     }
+}
 
-    async fn increment_count(&self, ctx: &Context, user: User) {
-        let (mut user_map, mut moai_map) = match self.get_data(ctx).await {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("Failed to get data message {}", e);
-                return;
-            }
-        };
-
-        if user_map.get(&user.id).is_none() {
-            user_map.insert(user.id, user.name);
-        }
-
-        let counter = moai_map.get(&user.id).unwrap_or(&0);
-        moai_map.insert(user.id, counter + 1);
-
-        if let Err(e) = self.write_data(ctx, (user_map, moai_map)).await {
-            eprintln!("Failed to save data {}", e);
-        }
-    }
+async fn task<F, Fut>(f: F) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: FnOnce(Data) -> Fut,
+    Fut: Future<Output = Data>,
+{
+    unsafe { TASK_QUEUE_COUNT += 1 };
+    let mut data_lock = DATA.lock().await;
+    let data = f(data_lock.clone()).await;
+    *data_lock = data;
+    unsafe { TASK_QUEUE_COUNT -= 1 };
+    Ok(())
 }
 
 struct Handler;
@@ -76,47 +70,80 @@ struct Handler;
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
         if msg.content == "!leaderboard" {
-            let (user_map, moai_map): Data = match DATA.lock().await.get_data(&ctx).await {
-                Ok(d) => d,
-                Err(e) => {
-                    eprintln!("Failed to deserialize message {}", e);
-                    return;
+            if let Err(e) = task(|(user_map, moai_map)| async move {
+                let mut leaderboard = user_map
+                    .iter()
+                    .map(|(user_id, user_name)| {
+                        (user_name.clone(), *moai_map.get(user_id).unwrap_or(&0))
+                    })
+                    .collect::<Vec<(String, usize)>>();
+
+                leaderboard.sort_by(|a, b| a.1.cmp(&b.1));
+
+                let everyone = format!(
+                    "Everyone : {}",
+                    leaderboard.iter().map(|(_, count)| count).sum::<usize>()
+                );
+
+                let individual = leaderboard
+                    .iter()
+                    .rev()
+                    .map(|(name, count)| format!("{} : {}\n", name, count))
+                    .collect::<String>();
+
+                if let Err(e) = msg
+                    .channel_id
+                    .say(&ctx.http, format!("{}\n\n{}", everyone, individual))
+                    .await
+                {
+                    eprintln!("Error sending message: {:?}", e);
                 }
-            };
 
-            let mut leaderboard = user_map
-                .iter()
-                .map(|(user_id, user_name)| {
-                    (user_name.clone(), *moai_map.get(user_id).unwrap_or(&0))
-                })
-                .collect::<Vec<(String, usize)>>();
-
-            leaderboard.sort_by(|a, b| a.1.cmp(&b.1));
-
-            let everyone = format!(
-                "Everyone : {}",
-                leaderboard.iter().map(|(_, count)| count).sum::<usize>()
-            );
-
-            let individual = leaderboard
-                .iter()
-                .rev()
-                .map(|(name, count)| format!("{} : {}\n", name, count))
-                .collect::<String>();
-
+                (user_map, moai_map)
+            })
+            .await
+            {
+                eprintln!("Leaderboard task failed {}", e);
+            }
+        } else if msg.content == "!moyaidebug" {
             if let Err(e) = msg
                 .channel_id
-                .say(&ctx.http, format!("{}\n\n{}", everyone, individual))
+                .say(
+                    &ctx.http,
+                    format!(
+                        "{} tasks in queue\nSynced {}\n\nSTORAGE_CHANNEL {}\nSTORAGE_MESSAGE {}\nDATA mutex {}\nSTORAGE mutex {}",
+                        unsafe { TASK_QUEUE_COUNT },
+                        unsafe { !DATA_CHANGED },
+                        STORAGE_CHANNEL,
+                        STORAGE_MESSAGE,
+                        DATA.try_lock().map_or_else(|_| "locked" , |_| "unlocked"),
+                        STORAGE.try_lock().map_or_else(|_| "locked" , |_| "unlocked"),
+                    ),
+                )
                 .await
             {
-                println!("Error sending message: {:?}", e);
+                eprintln!("Error sending message: {:?}", e);
             }
-        }
+        } else if msg.content.contains(":moyai:") || msg.content.contains('🗿') {
+            if let Err(e) = task(|(user_map, moai_map)| async move {
+                let mut user_map = user_map.clone();
+                let mut moai_map = moai_map.clone();
 
-        if ctx.cache.current_user_id() != msg.author.id
-            && (msg.content.contains(":moyai:") || msg.content.contains('🗿'))
-        {
-            DATA.lock().await.increment_count(&ctx, msg.author).await;
+                if user_map.get(&msg.author.id).is_none() {
+                    user_map.insert(msg.author.id, msg.author.name);
+                }
+
+                let counter = moai_map.get(&msg.author.id).unwrap_or(&0);
+                moai_map.insert(msg.author.id, counter + 1);
+
+                unsafe { DATA_CHANGED = true };
+
+                (user_map, moai_map)
+            })
+            .await
+            {
+                eprintln!("Message increment task failed {}", e);
+            }
         }
     }
 
@@ -129,14 +156,60 @@ impl EventHandler for Handler {
                     return;
                 }
             };
-            DATA.lock().await.increment_count(&ctx, user).await;
+            if let Err(e) = task(|(user_map, moai_map)| async move {
+                let mut user_map = user_map.clone();
+                let mut moai_map = moai_map.clone();
+
+                if user_map.get(&user.id).is_none() {
+                    user_map.insert(user.id, user.name);
+                }
+
+                let counter = moai_map.get(&user.id).unwrap_or(&0);
+                moai_map.insert(user.id, counter + 1);
+
+                unsafe { DATA_CHANGED = true };
+
+                (user_map, moai_map)
+            })
+            .await
+            {
+                eprintln!("Message increment task failed {}", e);
+            }
         }
     }
 
-    async fn ready(&self, _ctx: Context, ready: Ready) {
+    async fn ready(&self, ctx: Context, ready: Ready) {
         println!("{} ({}) is connected!", ready.user.name, ready.user.id);
-        // let data = (UserMap::new(), MoaiMap::new());
-        // DATA.lock().await.write_data(&ctx, data);
+        tokio::spawn(async move {
+            println!("Background sync task spawned");
+            {
+                let data = STORAGE
+                    .lock()
+                    .await
+                    .get_data(&ctx)
+                    .await
+                    .expect("Failed to retrieve data from storage");
+                *DATA.lock().await = data;
+            }
+            println!("Data retrieved from storage");
+
+            loop {
+                if unsafe { DATA_CHANGED } {
+                    if let Err(e) = STORAGE
+                        .lock()
+                        .await
+                        .write_data(&ctx, DATA.lock().await.clone())
+                        .await
+                    {
+                        eprintln!("Failed to save data {}", e);
+                    } else {
+                        println!("Data saved");
+                    }
+                    unsafe { DATA_CHANGED = false };
+                }
+                tokio::time::sleep(Duration::from_secs(900)).await;
+            }
+        });
     }
 }
 
