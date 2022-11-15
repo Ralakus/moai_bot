@@ -143,7 +143,10 @@ impl EventHandler for Handler {
                 let message = {
                     let result = STORAGE.lock().await.write_data(&ctx, DATA.lock().await.clone()).await;
                     match result {
-                        Ok(_) => "Successfully synced local and remote".to_string(),
+                        Ok(_) => { 
+                            unsafe { DATA_CHANGED = false };
+                            "Successfully synced local and remote".to_string()
+                        },
                         Err(e) => format!("Failed to sync data {}", e)
                     }
                 };
@@ -153,7 +156,6 @@ impl EventHandler for Handler {
                 {
                     eprintln!("Error sending message: {:?}", e);
                 }
-
             }
             moyai if moyai.contains(":moyai:") || moyai.contains('🗿') => if let Err(e) =
                     task(|data| async move { increment_user(&ctx, msg.author, data).await }).await
