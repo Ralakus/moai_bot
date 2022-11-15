@@ -12,6 +12,8 @@ use serenity::model::prelude::{ChannelId, MessageId, UserId};
 use serenity::model::user::User;
 use serenity::prelude::*;
 
+use tokio::sync::Mutex;
+
 type MoaiMap = HashMap<UserId, usize>;
 type UserMap = HashMap<UserId, String>;
 type Data = (UserMap, MoaiMap);
@@ -23,9 +25,8 @@ static mut TASK_QUEUE_COUNT: usize = 0;
 static mut DATA_CHANGED: bool = false;
 
 lazy_static! {
-    static ref STORAGE: tokio::sync::Mutex<DataStorage> = tokio::sync::Mutex::new(DataStorage);
-    static ref DATA: tokio::sync::Mutex<Data> =
-        tokio::sync::Mutex::new((UserMap::new(), MoaiMap::new()));
+    static ref STORAGE: Mutex<DataStorage> = Mutex::new(DataStorage);
+    static ref DATA: Mutex<Data> = Mutex::new((UserMap::new(), MoaiMap::new()));
 }
 
 struct DataStorage;
