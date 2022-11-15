@@ -9,6 +9,7 @@ use serenity::async_trait;
 use serenity::model::channel::{Message, Reaction};
 use serenity::model::gateway::Ready;
 use serenity::model::prelude::{ChannelId, MessageId, UserId};
+use serenity::model::user::User;
 use serenity::prelude::*;
 
 type MoaiMap = HashMap<UserId, usize>;
@@ -64,87 +65,103 @@ where
     Ok(())
 }
 
+async fn leaderboard(ctx: &Context, channel: ChannelId, data: Data) -> Data {
+    let (user_map, moai_map) = data;
+
+    let mut leaderboard = user_map
+        .iter()
+        .map(|(user_id, user_name)| (user_name.clone(), *moai_map.get(user_id).unwrap_or(&0)))
+        .collect::<Vec<(String, usize)>>();
+
+    leaderboard.sort_by(|a, b| a.1.cmp(&b.1));
+
+    let everyone = format!(
+        "Everyone : {}",
+        leaderboard.iter().map(|(_, count)| count).sum::<usize>()
+    );
+
+    let individual = leaderboard
+        .iter()
+        .rev()
+        .map(|(name, count)| format!("{} : {}\n", name, count))
+        .collect::<String>();
+
+    if let Err(e) = channel
+        .say(&ctx.http, format!("{}\n\n{}", everyone, individual))
+        .await
+    {
+        eprintln!("Error sending message: {:?}", e);
+    }
+
+    (user_map, moai_map)
+}
+
+async fn increment_user(_ctx: &Context, user: User, data: Data) -> Data {
+    let (mut user_map, mut moai_map) = data;
+
+    if user_map.get(&user.id).is_none() {
+        user_map.insert(user.id, user.name);
+    }
+
+    let counter = moai_map.get(&user.id).unwrap_or(&0);
+    moai_map.insert(user.id, counter + 1);
+
+    unsafe { DATA_CHANGED = true };
+
+    (user_map, moai_map)
+}
+
 struct Handler;
 
 #[async_trait]
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
-        if msg.content == "!leaderboard" {
-            if let Err(e) = task(|(user_map, moai_map)| async move {
-                let mut leaderboard = user_map
-                    .iter()
-                    .map(|(user_id, user_name)| {
-                        (user_name.clone(), *moai_map.get(user_id).unwrap_or(&0))
-                    })
-                    .collect::<Vec<(String, usize)>>();
-
-                leaderboard.sort_by(|a, b| a.1.cmp(&b.1));
-
-                let everyone = format!(
-                    "Everyone : {}",
-                    leaderboard.iter().map(|(_, count)| count).sum::<usize>()
-                );
-
-                let individual = leaderboard
-                    .iter()
-                    .rev()
-                    .map(|(name, count)| format!("{} : {}\n", name, count))
-                    .collect::<String>();
-
-                if let Err(e) = msg
-                    .channel_id
-                    .say(&ctx.http, format!("{}\n\n{}", everyone, individual))
+        match msg.content.as_str() {
+            "!leaderboard" => if let Err(e) =
+                    task(|data| async move { leaderboard(&ctx, msg.channel_id, data).await }).await
+                {
+                    eprintln!("Leaderboard task failed {}", e);
+                }
+            "!debug" => if let Err(e) = msg.channel_id.say(
+                        &ctx.http,
+                        format!(
+                            "{} tasks in queue\nSynced {}\n\nSTORAGE_CHANNEL {}\nSTORAGE_MESSAGE {}\nDATA mutex {}\nSTORAGE mutex {}",
+                            unsafe { TASK_QUEUE_COUNT },
+                            unsafe { !DATA_CHANGED },
+                            STORAGE_CHANNEL,
+                            STORAGE_MESSAGE,
+                            DATA.try_lock().map_or_else(|_| "locked" , |_| "unlocked"),
+                            STORAGE.try_lock().map_or_else(|_| "locked" , |_| "unlocked"),
+                        ),
+                    )
+                    .await
+                {
+                    eprintln!("Error sending message: {:?}", e);
+                }
+            "!sync" => {
+                println!("Manual sync");
+                let message = {
+                    let result = STORAGE.lock().await.write_data(&ctx, DATA.lock().await.clone()).await;
+                    match result {
+                        Ok(_) => "Successfully synced local and remote".to_string(),
+                        Err(e) => format!("Failed to sync data {}", e)
+                    }
+                };
+                if let Err(e) = msg.channel_id
+                    .say(&ctx.http, message)
                     .await
                 {
                     eprintln!("Error sending message: {:?}", e);
                 }
 
-                (user_map, moai_map)
-            })
-            .await
-            {
-                eprintln!("Leaderboard task failed {}", e);
             }
-        } else if msg.content == "!moyaidebug" {
-            if let Err(e) = msg
-                .channel_id
-                .say(
-                    &ctx.http,
-                    format!(
-                        "{} tasks in queue\nSynced {}\n\nSTORAGE_CHANNEL {}\nSTORAGE_MESSAGE {}\nDATA mutex {}\nSTORAGE mutex {}",
-                        unsafe { TASK_QUEUE_COUNT },
-                        unsafe { !DATA_CHANGED },
-                        STORAGE_CHANNEL,
-                        STORAGE_MESSAGE,
-                        DATA.try_lock().map_or_else(|_| "locked" , |_| "unlocked"),
-                        STORAGE.try_lock().map_or_else(|_| "locked" , |_| "unlocked"),
-                    ),
-                )
-                .await
-            {
-                eprintln!("Error sending message: {:?}", e);
-            }
-        } else if msg.content.contains(":moyai:") || msg.content.contains('🗿') {
-            if let Err(e) = task(|(user_map, moai_map)| async move {
-                let mut user_map = user_map.clone();
-                let mut moai_map = moai_map.clone();
-
-                if user_map.get(&msg.author.id).is_none() {
-                    user_map.insert(msg.author.id, msg.author.name);
+            moyai if moyai.contains(":moyai:") || moyai.contains('🗿') => if let Err(e) =
+                    task(|data| async move { increment_user(&ctx, msg.author, data).await }).await
+                {
+                    eprintln!("Message increment task failed {}", e);
                 }
-
-                let counter = moai_map.get(&msg.author.id).unwrap_or(&0);
-                moai_map.insert(msg.author.id, counter + 1);
-
-                unsafe { DATA_CHANGED = true };
-
-                (user_map, moai_map)
-            })
-            .await
-            {
-                eprintln!("Message increment task failed {}", e);
-            }
-        }
+            _ => (),
+        };
     }
 
     async fn reaction_add(&self, ctx: Context, reaction: Reaction) {
@@ -156,22 +173,7 @@ impl EventHandler for Handler {
                     return;
                 }
             };
-            if let Err(e) = task(|(user_map, moai_map)| async move {
-                let mut user_map = user_map.clone();
-                let mut moai_map = moai_map.clone();
-
-                if user_map.get(&user.id).is_none() {
-                    user_map.insert(user.id, user.name);
-                }
-
-                let counter = moai_map.get(&user.id).unwrap_or(&0);
-                moai_map.insert(user.id, counter + 1);
-
-                unsafe { DATA_CHANGED = true };
-
-                (user_map, moai_map)
-            })
-            .await
+            if let Err(e) = task(|data| async move { increment_user(&ctx, user, data).await }).await
             {
                 eprintln!("Message increment task failed {}", e);
             }
